@@ -1,0 +1,285 @@
+---
+title: "PXD016647_DIA_caseStudy5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(limma)
+devtools::load_all("/stornext/General/data/academic/lab_davis/prot/benchmarking/msImpute/")
+```
+
+```{r}
+dia <- read.delim("/stornext/General/data/academic/lab_davis/prot/benchmarking/PXD016647/Spike-in-biol-var-OT-SN-Report.txt", header = TRUE, stringsAsFactors = FALSE)
+
+
+dia$experiment <- paste(dia$R.Condition, dia$R.Replicate,sep="_")
+table(dia$experiment)
+
+table(dia$R.Replicate)
+table(dia$R.Condition)
+table(grepl("UPS", dia$PG.ProteinAccessions))
+table(grepl("CON|REV", dia$PG.ProteinAccessions))
+table(grepl("ups", dia$PG.BGSFASTAHeader))
+table(grepl("iRT", dia$PG.BGSUniProtId))
+table(dia$SpikeIn=="True")
+
+table(dia$PG.BGSDatabase)
+sum(table(dia$PG.BGSDatabase)[grep("sp", names(table(dia$PG.BGSDatabase)), invert = TRUE)])
+
+hist(dia$EG.Qvalue)
+table(table(dia$EG.PrecursorId) > 25)
+
+table(dia$IsProteotypic, dia$EG.Qvalue < 0.1)
+
+# keep1 <- (dia$IsProteotypic == "True")
+keep2 <- (dia$EG.Qvalue < 0.1)
+
+table(keep1&keep2, dia$SpikeIn)
+
+
+dia <- dia[keep2,]
+
+
+# MS1 --------------
+dia_ms1 <- tidyr::spread(dia[,c("experiment","EG.PrecursorId", "FG.NormalizedMS1PeakArea")], key = experiment, value = FG.NormalizedMS1PeakArea)
+
+hist(log2(data.matrix(dia_ms1[,-1]))) # the study says the limit of detection is 100, and they removed anything less
+# the limit of detection
+
+table(log2(data.matrix(dia_ms1[,-1])) < log2(100))
+
+
+# MS2 --------------
+
+dia_ms2 <- tidyr::spread(dia[,c("experiment","EG.PrecursorId", "FG.NormalizedMS2PeakArea")], key = experiment, value = FG.NormalizedMS2PeakArea)
+
+hist(log2(data.matrix(dia_ms2[,-1])))
+
+
+dia_ms1[dia_ms1==1] <- NA
+dia_ms2[dia_ms2==1] <- NA
+
+# par(mfrow=c(1,2))
+# pcv <- plotCV2(normalizeBetweenArrays(log2(data.matrix(dia_ms2[,-1]))), outlier = FALSE)
+# mtext("MS2")
+# pcv <- plotCV2(normalizeBetweenArrays(log2(data.matrix(dia_ms1[,-1]))), outlier = FALSE)
+# mtext("MS1")
+
+y_dia_ms2 <- log2(data.matrix(dia_ms2[,-1]))
+rownames(y_dia_ms2) <- dia_ms2$EG.PrecursorId
+
+keep <- rowSums(!is.na(y_dia_ms2)) >=4
+table(keep)
+
+y_dia_ms2 <- y_dia_ms2[keep,]
+y_dda <- y_dia_ms2
+```
+
+### imputation (barycenter + SOTA methods)
+```{r include=TRUE}
+library(imputeLCMD)
+library(limma)
+library(ggplot2)
+library(ggsci)
+library(rrcovNA)
+
+impute.perseus <- function(x, width=0.3, shift=1.8) {
+  # distributions are induced by measured values in each sample
+  data.mean <- colMeans(x, na.rm = TRUE)
+  data.sd <- matrixStats::colSds(x, na.rm = TRUE)
+  n <- nrow(x)
+  z <- rmvnorm(n, mean = data.mean - shift*data.sd , sigma = diag(data.sd*width))
+  x[is.na(x)] <- z[is.na(x)]
+  return(x)
+}
+
+ups <- unique(dia$EG.PrecursorId[dia$SpikeIn == "True"])
+
+group <- gsub("(S[12345])_[1-9]",
+              "\\1",
+              colnames(y_dda))
+
+design <- model.matrix(~ group)
+```
+
+
+```{r results='hide', include=TRUE}
+
+y_msImpute <- msImpute(y_dda, 
+                       # rank.max = 2,
+                       # method = "v2-mnar", 
+                      method = "v2",
+                       group = group)
+
+
+
+y_msImpute_bary <- msImpute(y_dda, 
+                       # rank.max = 2,
+                       method = "v2-mnar",
+                      # method = "v2",
+                       group = group)
+
+
+
+y_MLE <- impute.wrapper.MLE(y_dda)
+y_impSeq <- impSeq(y_dda)
+y_knn <- impute.wrapper.KNN(y_dda, K = 15)
+
+
+y_minDet <- impute.MinDet(y_dda, q = 0.01)
+# y_minProb <- impute.MinProb(y_dia,  0.3,  1.8)
+
+y_perseus <- impute.perseus(y_dda)
+
+# pcv <- plotCV2(limma::normalizeBetweenArrays(y_perseus,
+#                                              method = 'quantile'), 
+#                main = "perseus")
+
+y_qrilc <- impute.QRILC(y_dda, 1)[[1]]
+
+
+sOa_imps <- readRDS("/stornext/Home/data/allstaff/h/hediyehzadeh.s/softImpute_low_rank_experimentation/impute_PXD016647dia_sOa_filter4obs_noNorm.rds")
+names(sOa_imps) <- c("RF","Mice","EM","BPCA","LLS")
+
+sOa_imps <- sOa_imps[c("RF","Mice","EM","BPCA")]
+
+z <- m <- rownames(sOa_imps[[1]])
+# m <- paste0("_", m)
+
+all(rownames(y_dda) == rownames(sOa_imps[[1]]))
+
+rowsname <- rownames(y_dda)[rownames(y_dda) %in% m]
+
+all(rownames(y_dda[rowsname,]) == rownames(sOa_imps[[1]][rowsname,]))
+
+mats <- list(#"MLE"=y_MLE[rowsname,],
+             "KNN"= y_knn[rowsname,],
+             #"Perseus"= y_perseus[rowsname,],
+             # "QRILC" = y_qrilc[rowsname,],
+             "impSeq" = y_impSeq[rowsname,],
+             #"erank" = y_msImpute[rowsname,],
+             "barycenter" = y_msImpute_bary[rowsname,],
+             
+             "baseline" = y_dda[rowsname,])
+
+
+
+
+
+mats <- c(sOa_imps, mats)
+
+
+n_ups <- 500
+
+
+topN <- list()
+fullTables <- list()
+fullTables2 <- list()
+for(i in seq_along(mats)){
+  message("processing ", names(mats)[i])
+   E <- normalizeBetweenArrays(mats[[i]], method = "quantile")
+  # E <- normalizeMedianAbsValues(mats[[i]])
+
+   fit <- lmFit(E, design = design)
+   fit <- eBayes(fit)
+   print(summary(decideTests(fit)))
+
+  tp <- topTable(fit, coef=ncol(fit), number = Inf, p.value = 1)
+  tp$de <- ifelse(tp$adj.P.Val < 0.05,1,0)
+  tp$isUPS <- ifelse(rownames(tp) %in% ups,1,0)
+  #tp$isdeUPS <- ifelse(tp$isUPS==1 & tp$de==1,1,0)
+  tp$TP <- ifelse(tp$de==1 & tp$isUPS==1,1,0) # a ups called DE is a true positive
+  tp$FN <- ifelse(tp$de==0 & tp$isUPS==1,1,0) # a ups called not DE is a false negative
+  tp$fd <- ifelse(tp$isUPS==0 & tp$de ==1 ,1,0) # & !complete.cases(y_dda[match(rownames(tp), rownames(y_dda)),])
+  tp$FDR <- cumsum(tp$fd)/cumsum(tp$de)
+  topN[[names(mats)[i]]] <- data.frame(N=seq_len(n_ups),
+                                       numUPS=cumsum(tp$isUPS)[seq_len(n_ups)],
+                                       #numUPS=cumsum(tp$TP)[seq_len(n_ups)],
+                                       FDR=tp$FDR[seq_len(n_ups)],
+                                       nominalFDR= ifelse(seq_len(n_ups) == which(tp$adj.P.Val > 0.05)[1],1,0),
+                                       method=names(mats)[i])
+  
+  
+  #tp <- tp[order(tp$P.Value, decreasing = TRUE),]
+
+  fullTables[[names(mats)[i]]] <- data.frame(
+    
+    # TP = cumsum(tp$TP),
+    # FN = cumsum(tp$FN),
+    # FDR = tp$FDR,
+    # FP = cumsum(tp$fd),
+    # nominalFDR_5percent = ifelse(seq_len(nrow(tp)) == which(tp$adj.P.Val > 0.05)[1], 1, 0),
+    # nominalFDR_10percent = ifelse(seq_len(nrow(tp)) == which(tp$adj.P.Val > 0.1)[1], 1, 0),
+    # method=names(mats)[i]
+    
+    # replace with labels and predictions to use pROC
+    predictions = -log10(tp$P.Value),
+    labels = tp$isUPS
+    
+    
+    
+    )
+  
+  fullTables2[[names(mats)[i]]] <- data.frame(
+    
+    # TP = cumsum(tp$isUPS)/cumsum(tp$de),
+    # FP = (cumsum(1-tp$isUPS)/cumsum(tp$de))
+    
+    # TP = cumsum(tp$isUPS),
+    # FP = cumsum(1-tp$isUPS)
+    
+    TP = cumsum(tp$TP),
+    FP = cumsum(tp$fd)
+    
+    
+
+    
+    )
+}
+
+
+topN <- do.call(rbind, topN)
+fullTables <- do.call(rbind, fullTables)
+fullTables$method <- gsub("(.*)\\.(.*)","\\1", rownames(fullTables))
+
+
+fullTables2 <- do.call(rbind, fullTables2)
+fullTables2$method <- gsub("(.*)\\.(.*)","\\1", rownames(fullTables2))
+
+# fullTables[fullTables$nominalFDR_5percent==1,]
+```
+
+### Top N and ROC evaluations
+```{r include=TRUE, fig.cap="Number of True Positives and False Positives (Left) and ROC curves (right) for the Barycenter, PIP and state-of-the-art imputation approaches.", out.width="95%", fig.width=12}
+library(plotROC)
+library(patchwork)
+
+p2 <- ggplot(fullTables, aes(m = predictions, d = labels, group = method, color = method))+ geom_roc(n.cuts=3,labels=FALSE) +
+   style_roc() + 
+   #geom_rocci(fill="pink") +
+   scale_color_npg()
+
+
+
+# p1 <- ggplot(topN, aes(y=numUPS, x=N, color=method)) +
+#   geom_line(size=1.5) + scale_color_simpsons() + theme_minimal() +
+#   labs(title = "PASS00589-DDA") + xlab("Top N peptides") + ylab("Number of spiked peptides")
+
+
+fullTables2$method <- factor(fullTables2$method, 
+                             levels = c("BPCA", "EM", "impSeq", "KNN", "Mice", "RF","baseline","barycenter"))
+
+p1 <- ggplot(fullTables2, aes(y=TP, x=FP, color=method, group = method)) +
+  geom_line(size=1) + scale_color_npg() + theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text=element_text(colour="black")) + 
+  labs(title = "PXD016647-DIA") + xlab("False Positives") + ylab("True Positives")
+
+# p1 + p2
+p1
+```
+

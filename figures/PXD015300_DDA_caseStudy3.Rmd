@@ -1,0 +1,265 @@
+---
+title: "PXD015300_DDA_caseStudy3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(limma)
+devtools::load_all("/stornext/General/data/academic/lab_davis/prot/benchmarking/msImpute/")
+```
+
+```{r}
+dda <- read.delim("/stornext/General/data/academic/lab_davis/prot/benchmarking/PXD015300/evidence.tsv",
+                  stringsAsFactors = FALSE)
+
+
+
+keep1 <- (!grepl("CON__|REV__", dda$Leading.razor.protein))
+keep2 <- (dda$Modifications %in% "Unmodified")
+
+
+
+dda <- dda[keep1&keep2,]
+dda <- dda[dda$Charge > 1,]
+dda$PeptideID <- paste0(dda$Modified.sequence, dda$Charge)
+dda$matrix.row.id <- paste(dda$PeptideID, dda$Leading.razor.protein, sep ="_")
+
+
+genes <- dda[,c("PeptideID","matrix.row.id", "Leading.razor.protein")]
+genes <- genes[!duplicated(genes),]
+
+
+y_dda <- evidenceToMatrix(dda)
+
+keep3 <- rowSums(!is.na(y_dda)) >= 4
+table(keep3)
+
+
+
+y_dda <- y_dda[keep3,]
+
+#ensure column names are allowed names
+colnames(y_dda) <- gsub("-","_", colnames(y_dda))
+genes <- genes[match(rownames(y_dda), genes$PeptideID),]
+rownames(y_dda) <- genes$matrix.row.id
+
+
+
+
+y_dda <- log2(y_dda)
+# y_dda <- normalizeBetweenArrays(y_dda, method = "quantile")
+colnames(y_dda) <- gsub("-","_", colnames(y_dda))
+```
+
+### imputation (barycenter + SOTA methods)
+```{r include=TRUE}
+library(imputeLCMD)
+library(limma)
+library(ggplot2)
+library(ggsci)
+library(rrcovNA)
+
+impute.perseus <- function(x, width=0.3, shift=1.8) {
+  # distributions are induced by measured values in each sample
+  data.mean <- colMeans(x, na.rm = TRUE)
+  data.sd <- matrixStats::colSds(x, na.rm = TRUE)
+  n <- nrow(x)
+  z <- rmvnorm(n, mean = data.mean - shift*data.sd , sigma = diag(data.sd*width))
+  x[is.na(x)] <- z[is.na(x)]
+  return(x)
+}
+
+probable_hints <- c("sp|P44374|SFG2_YEAST", "sp|P55752|ISCB_YEAST","sp|P07834|CDC4_YEAST",
+                    "sp|P44683|PGA4_YEAST",
+                    "sp|P55249|ZRT4_YEAST", "sp|P44015|VAC2_YEAST", "sp|P44983|UTR6_YEAST")
+
+
+
+
+table(probable_hints %in% gsub("(.*)_(.*)_(.*)_(.*)","\\3_\\4", rownames(y_dda)))
+
+group <- gsub(".*_(sample[1234])_[ABC]",
+              "\\1",
+              colnames(y_dda))
+
+design <- model.matrix(~ group)
+```
+
+
+```{r results='hide', include=TRUE}
+
+y_msImpute <- msImpute(y_dda, 
+                       rank.max = 2,
+                       #method = "v2-mnar", 
+                      #method = "v1",
+                       group = group)
+
+
+
+
+
+
+y_MLE <- impute.wrapper.MLE(y_dda)
+y_impSeq <- impSeq(y_dda)
+y_knn <- impute.wrapper.KNN(y_dda, K = 15)
+
+
+y_minDet <- impute.MinDet(y_dda, q = 0.01)
+# y_minProb <- impute.MinProb(y_dia,  0.3,  1.8)
+
+y_perseus <- impute.perseus(y_dda)
+
+# pcv <- plotCV2(limma::normalizeBetweenArrays(y_perseus,
+#                                              method = 'quantile'), 
+#                main = "perseus")
+
+y_qrilc <- impute.QRILC(y_dda, 1)[[1]]
+
+
+sOa_imps <- readRDS("/stornext/Home/data/allstaff/h/hediyehzadeh.s/softImpute_low_rank_experimentation/impute_PXD015300_sOa_filter4obs_noNorm.rds")
+names(sOa_imps) <- c("RF","Mice","EM","BPCA","LLS")
+
+sOa_imps <- sOa_imps[c("RF","Mice","EM","BPCA")]
+
+z <- m <- rownames(sOa_imps[[1]])
+# m <- paste0("_", m)
+
+# rowsname <- rownames(y)[rownames(y) %in% m]
+
+all(rownames(y_dda) == rownames(sOa_imps[[1]]))
+
+mats <- list(#"MLE"=y_MLE[rowsname,],
+             "KNN"= y_knn,
+  "impSeq" = y_impSeq,
+             #"Perseus"= y_perseus,
+             # "QRILC" = y_qrilc[rowsname,],
+             
+             "barycenter" = y_msImpute,
+             
+             "baseline" = y_dda)
+
+
+
+
+
+mats <- c(sOa_imps, mats)
+
+
+n_ups <- 500
+
+
+topN <- list()
+fullTables <- list()
+fullTables2 <- list()
+for(i in seq_along(mats)){
+  message("processing ", names(mats)[i])
+   E <- normalizeBetweenArrays(mats[[i]], method = "quantile")
+  # E <- normalizeMedianAbsValues(mats[[i]])
+
+   fit <- lmFit(E, design = design)
+   fit <- contrasts.fit(fit, contrasts = makeContrasts(groupsample4 - groupsample2, levels = design))
+   fit <- eBayes(fit)
+   print(summary(decideTests(fit)))
+
+  tp <- topTable(fit, coef=ncol(fit), number = Inf, p.value = 1)
+  tp$de <- ifelse(tp$adj.P.Val < 0.05,1,0)
+  tp$isUPS <- ifelse(gsub("(.*)_(.*)_(.*)_(.*)","\\3_\\4", rownames(tp)) %in% probable_hints,1,0)
+  #tp$isdeUPS <- ifelse(tp$isUPS==1 & tp$de==1,1,0)
+  tp$TP <- ifelse(tp$de==1 & tp$isUPS==1,1,0) # a ups called DE is a true positive
+  tp$FN <- ifelse(tp$de==0 & tp$isUPS==1,1,0) # a ups called not DE is a false negative
+  tp$fd <- ifelse(tp$isUPS==0 & tp$de ==1 ,1,0) # & !complete.cases(y_dda[match(rownames(tp), rownames(y_dda)),])
+  tp$FDR <- cumsum(tp$fd)/cumsum(tp$de)
+  topN[[names(mats)[i]]] <- data.frame(N=seq_len(n_ups),
+                                       numUPS=cumsum(tp$isUPS)[seq_len(n_ups)],
+                                       #numUPS=cumsum(tp$TP)[seq_len(n_ups)],
+                                       FDR=tp$FDR[seq_len(n_ups)],
+                                       nominalFDR= ifelse(seq_len(n_ups) == which(tp$adj.P.Val > 0.05)[1],1,0),
+                                       method=names(mats)[i])
+  
+  
+  #tp <- tp[order(tp$P.Value, decreasing = TRUE),]
+
+  fullTables[[names(mats)[i]]] <- data.frame(
+    
+    # TP = cumsum(tp$TP),
+    # FN = cumsum(tp$FN),
+    # FDR = tp$FDR,
+    # FP = cumsum(tp$fd),
+    # nominalFDR_5percent = ifelse(seq_len(nrow(tp)) == which(tp$adj.P.Val > 0.05)[1], 1, 0),
+    # nominalFDR_10percent = ifelse(seq_len(nrow(tp)) == which(tp$adj.P.Val > 0.1)[1], 1, 0),
+    # method=names(mats)[i]
+    
+    # replace with labels and predictions to use pROC
+    predictions = -log10(tp$P.Value),
+    labels = tp$isUPS
+    
+    
+    
+    )
+  
+  fullTables2[[names(mats)[i]]] <- data.frame(
+    
+    # TP = cumsum(tp$isUPS)/cumsum(tp$de),
+    # FP = (cumsum(1-tp$isUPS)/cumsum(tp$de))
+    
+    # TP = cumsum(tp$isUPS),
+    # FP = cumsum(1-tp$isUPS)
+    
+    TP = cumsum(tp$TP),
+    FP = cumsum(tp$fd)
+    
+    
+
+    
+    )
+}
+
+
+topN <- do.call(rbind, topN)
+fullTables <- do.call(rbind, fullTables)
+fullTables$method <- gsub("(.*)\\.(.*)","\\1", rownames(fullTables))
+
+
+fullTables2 <- do.call(rbind, fullTables2)
+fullTables2$method <- gsub("(.*)\\.(.*)","\\1", rownames(fullTables2))
+
+# fullTables[fullTables$nominalFDR_5percent==1,]
+```
+
+### Top N and ROC evaluations
+```{r include=TRUE, fig.cap="Number of True Positives and False Positives (Left) and ROC curves (right) for the Barycenter, PIP and state-of-the-art imputation approaches.", out.width="95%", fig.width=12}
+library(plotROC)
+library(patchwork)
+
+p2 <- ggplot(fullTables, aes(m = predictions, d = labels, group = method, color = method))+ geom_roc(n.cuts=3,labels=FALSE) +
+   style_roc() + 
+   #geom_rocci(fill="pink") +
+   scale_color_npg()
+
+
+
+# p1 <- ggplot(topN, aes(y=numUPS, x=N, color=method)) +
+#   geom_line(size=1.5) + scale_color_simpsons() + theme_minimal() +
+#   labs(title = "PASS00589-DDA") + xlab("Top N peptides") + ylab("Number of spiked peptides")
+
+
+fullTables2$method <- factor(fullTables2$method, 
+                             levels = c("BPCA", "EM", "impSeq", "KNN", "Mice", "RF","baseline","barycenter"))
+
+p1 <- ggplot(fullTables2, aes(y=TP, x=FP, color=method, group = method)) +
+  geom_line(size=1) + scale_color_npg() + theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), axis.text=element_text(colour="black")) + 
+  labs(title = "PXD015300-DDA") + xlab("False Positives") + ylab("True Positives")
+
+# p1 + p2
+p1
+
+
+
+```
+
